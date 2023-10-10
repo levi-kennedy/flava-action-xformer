@@ -14,13 +14,17 @@ from rlbench.action_modes.gripper_action_modes import Discrete
 from rlbench.backend.const import *
 from rlbench.backend.utils import task_file_to_task_class
 from rlbench.environment import Environment
+from rlbench.const import colors
+
 from tqdm.auto import tqdm, trange
 
 from utils import convert_keypoints, keypoint_discovery
+from transformers import FlavaProcessor, FlavaModel
+
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("save_path", ".", "Where to save the preprocessed training data")
+flags.DEFINE_string("save_path", "/home/levi/data/flavaActionDecoderData", "Where to save the preprocessed training data")
 # flags.DEFINE_list(
 #     "tasks",    
 #     [
@@ -44,13 +48,13 @@ flags.DEFINE_list(
 )
 flags.DEFINE_list("image_size", [256, 256], "The size of the images to save.")
 flags.DEFINE_integer(
-    "train_episodes_per_task", 2, "The number of episodes to collect per task."
+    "train_episodes_per_task", 5, "The number of episodes to collect per task."
 )
 flags.DEFINE_integer(
-    "val_episodes_per_task", 1, "The number of episodes to collect per task."
+    "val_episodes_per_task", 2, "The number of episodes to collect per task."
 )
 flags.DEFINE_integer(
-    "variations", 3, "Number of variations to collect per task. -1 for all."
+    "variations", 5, "Number of variations to collect per task. -1 for all."
 )
 flags.DEFINE_integer("num_frames", 1, "Number of frames to stack.")
 flags.DEFINE_integer("vox_size", 16, "Voxel size to discretize translation.")
@@ -65,17 +69,91 @@ flags.DEFINE_list("encoder_emb", [197*2, 768], "The size of the Flava embedding 
 # fmt: on
 
 # data fields we want to include or exclude
-TO_BE_REMOVED = ["misc", "task_low_dim_state"]
+TO_BE_REMOVED = [
+    "misc", 
+    "task_low_dim_state",
+    "disc_action",
+    "gripper_pose_delta",
+]
 TO_BE_ADDED = [
     "cont_action",
-    "disc_action",
     "time",
-    "gripper_pose_delta",
     "task_id",
     "variation_id",
     "ignore_collisions",
+    "encoder_emb",
 ]
 
+def get_instruct(task, variation):
+    # https://github.com/stepjam/RLBench/tree/master/rlbench/tasks
+    if task == "stack_wine":
+        return f"place the wine bottle on the wine rack."
+    elif task == "take_umbrella_out_of_umbrella_stand":
+        return f"grasping the umbrella by its handle, lift it up and out of the stand."
+    elif task == "reach_target":
+        return f"touch the {colors[variation][0]} ball with the panda gripper."
+    elif task == "pick_and_lift":
+        return f"pick up the {colors[variation]} block and lift it up to the target."
+    elif task == "pick_up_cup":
+        return f"grasp the {colors[variation]} cup and lift it."
+    elif task == "put_rubbish_in_bin":
+        return f"pick up the rubbish and leave it in the trash can."
+    elif task == "take_lid_off_saucepan":
+        return "grip the saucepan's lid and remove it from the pan."
+    elif task == "open_drawer":
+        OPTIONS = ["bottom", "middle", "top"]
+        return f"grip the {OPTIONS[variation]} handle and pull the {OPTIONS[variation]} drawer open."
+    elif task == "meat_off_grill":
+        OPTIONS = ["chicken", "steak"]
+        return f"pick up the {OPTIONS[variation]} and place it next to the grill."
+    elif task == "put_item_in_drawer":
+        OPTIONS = ["bottom", "middle", "top"]
+        return f"open the {OPTIONS[variation]} drawer and place the block inside of it."
+    elif task == "turn_tap":
+        OPTIONS = ["left", "right"]
+        return "grasp the {OPTIONS[variation]} tap and turn it."
+    elif task == "put_groceries_in_cupboard":
+        GROCERY_NAMES = [
+            "crackers",
+            "chocolate jello",
+            "strawberry jello",
+            "soup",
+            "tuna",
+            "spam",
+            "coffee",
+            "mustard",
+            "sugar",
+        ]
+        return f"pick up the {GROCERY_NAMES[variation]} and place it in the cupboard."
+    elif task == "place_shape_in_shape_sorter":
+        SHAPE_NAMES = ["cube", "cylinder", "triangular prism", "star", "moon"]
+        return f"pick up the {SHAPE_NAMES[variation]} and put it in the sorter."
+    elif task == "light_bulb_in":
+        return f"pick up the light bulb from the {colors[variation]} stand, lift it up to just above the lamp, then screw it down into the lamp in a clockwise fashion."
+    elif task == "close_jar":
+        return f"close the {colors[variation]} jar."
+    elif task == "stack_blocks":
+        MAX_STACKED_BLOCKS = 3
+        color_index = int(variation / MAX_STACKED_BLOCKS)
+        blocks_to_stack = 2 + variation % MAX_STACKED_BLOCKS
+        color_name, color_rgb = colors[color_index]
+        return (
+            f"place {blocks_to_stack} of the {color_name} cubes on top of each other."
+        )
+    elif task == "put_in_safe":
+        safe = {0: "bottom", 1: "middle", 2: "top"}
+        return f"put the money away in the safe on the {safe[variation]} shelf."
+    # elif task == "push_buttons":
+    #     pass
+    elif task == "insert_onto_square_peg":
+        return f"put the ring on the {colors[variation]} spoke."
+    elif task == "stack_cups":
+        target_color_name, target_rgb = colors[variation]
+        return f"stack the other cups on top of the {target_color_name} cup."
+    elif task == "place_cups":  # 3 variations
+        return f"place {variation + 1} cups on the cup holder."
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
 def get_shape_dtype(k, dummy_timestep):
     if k == "gripper_open" or k == "time":
@@ -109,38 +187,38 @@ def get_shape_dtype(k, dummy_timestep):
 
 
 # Define the parameters of the hdf5 files we want to create using parameters from the dummy timestep
-def create_hdf5(rlbench_env, task, hdf5_name, hdf5_shuffled_name, size=int(1e5)):
-    dummy_task = rlbench_env.get_task(task)
-    dummy_demo = np.array(dummy_task.get_demos(1, live_demos=True)[0])
-    dummy_timestep = dummy_demo[0]
+def create_hdf5(rlbench_env, task, hdf5_name, size=int(1e5)):
+    # dummy_task = rlbench_env.get_task(task)
+    # dummy_demo = np.array(dummy_task.get_demos(1, live_demos=True)[0])
+    # dummy_timestep = dummy_demo[0]
 
-    keys = list(dummy_timestep.__dict__.keys())
-    # Remove any keys that are None
-    keys = [k for k in keys if dummy_timestep.__dict__[k] is not None]
-    keys.extend(TO_BE_ADDED)
-    # Remove any keys that are in the TO_BE_REMOVED list
-    keys = [k for k in keys if k not in TO_BE_REMOVED]
+    # keys = list(dummy_timestep.__dict__.keys())
+    # # Remove any keys that are None
+    # keys = [k for k in keys if dummy_timestep.__dict__[k] is not None]
+    # keys.extend(TO_BE_ADDED)
+    # # Remove any keys that are in the TO_BE_REMOVED list
+    # keys = [k for k in keys if k not in TO_BE_REMOVED]
     
 
     h5_file = h5py.File(hdf5_name, "x")
-    h5_file_shuffled = h5py.File(hdf5_shuffled_name, "x")
+    # h5_file_shuffled = h5py.File(hdf5_shuffled_name, "x")
 
-    for k in keys:
-        v_shape, v_dtype = get_shape_dtype(k, dummy_timestep)
+    # for k in keys:
+    #     v_shape, v_dtype = get_shape_dtype(k, dummy_timestep)
 
-        h5_file.create_dataset(
-            k,
-            (size, FLAGS.num_frames, *v_shape),
-            dtype=v_dtype,
-            chunks=(16, FLAGS.num_frames, *v_shape),
-        )
-        h5_file_shuffled.create_dataset(
-            k,
-            (size, FLAGS.num_frames, *v_shape),
-            dtype=v_dtype,
-            chunks=(16, FLAGS.num_frames, *v_shape),
-        )
-    return h5_file, h5_file_shuffled
+    #     h5_file.create_dataset(
+    #         k,
+    #         (size, FLAGS.num_frames, *v_shape),
+    #         dtype=v_dtype,
+    #         chunks=(16, FLAGS.num_frames, *v_shape),
+    #     )
+    #     # h5_file_shuffled.create_dataset(
+    #     #     k,
+    #     #     (size, FLAGS.num_frames, *v_shape),
+    #     #     dtype=v_dtype,
+    #     #     chunks=(16, FLAGS.num_frames, *v_shape),
+    #     # )
+    return h5_file
 
 
 def collect_data(
@@ -149,31 +227,25 @@ def collect_data(
     task_name,
     tasks_with_problems,
     h5_file,
-    h5_file_shuffled,
     num_episodes,
 ):
     variation_count = 0
-    total_timestep = 0
+    grp_id = 0
 
-    task_env = rlbench_env.get_task(task)
+    task_env = rlbench_env.get_task(task)    
 
-    dummy_task = rlbench_env.get_task(task)
-    dummy_demo = np.array(dummy_task.get_demos(1, live_demos=True)[0])
-    dummy_timestep = dummy_demo[0]
-
-    keys = list(dummy_timestep.__dict__.keys())
-    keys = [k for k in keys if dummy_timestep.__dict__[k] is not None]
-    keys.extend(TO_BE_ADDED)
-    # Remove any keys that are in the TO_BE_REMOVED list
-    keys = [k for k in keys if k not in TO_BE_REMOVED]
-
-    total_data = defaultdict(list)
+    total_data = deque()
 
     var_target = task_env.variation_count()
     if FLAGS.variations >= 0:
         var_target = np.minimum(FLAGS.variations, var_target)
 
     print("Task:", task_env.get_name(), "// Variation Target:", var_target)
+
+    # Retrieve the Flava model and processor
+    flava_model = FlavaModel.from_pretrained('facebook/flava-full')
+    flava_processor = FlavaProcessor.from_pretrained('facebook/flava-full')
+
     # Iterate through the variations of the task
     while True:
         if variation_count >= var_target:
@@ -212,108 +284,108 @@ def collect_data(
                     abort_variation = True
                     break
                 
-                def add_more(time, demo, inital_obs, episode_keypoints):
-                    """
-                    For the single time provided, get the actions and observations for the rest of the keypoints
-                                           
-                    """
-                    obs = inital_obs
-                    more_cont_action = []
-                    more_disc_action = []
-                    more_obs = []
-                    more_timestep = []
-                    for k, keypoint in enumerate(episode_keypoints):
-                        obs_tp1 = demo[keypoint]
-                        cont_action, disc_action = convert_keypoints(
-                            demo,
-                            episode_keypoints,
-                            FLAGS.vox_size,
-                            FLAGS.rotation_resolution,
-                        )
-                        more_obs.append(obs)
-                        t = (1.0 - time / float(len(demo) - 1)) * 2.0 - 1.0
-                        more_timestep.append(t)
-                        more_cont_action.append(cont_action)
-                        more_disc_action.append(disc_action)
-                        obs = obs_tp1
-                        t = keypoint
-                    return more_obs, more_cont_action, more_disc_action, more_timestep
+                
                 # Element indices of the keypoints in the demo
                 episode_keypoints = keypoint_discovery(demo)
-                cont_action_list = []
-                disc_action_list = []
+                # Convert all the keypoints into list of poses at the keypoint indices
+                cont_action_list, disc_action_list = convert_keypoints(
+                    demo, episode_keypoints, action_type="cont",
+                )
                 obs_list = []
-                time_list = []
-                for i in range(len(demo) - 1):
-                    obs = demo[i]
-                    # If our starting point is past one of the keypoints, then remove it
-                    while len(episode_keypoints) > 0 and i >= episode_keypoints[0]:
-                        episode_keypoints = episode_keypoints[1:]
+                time_list = []               
+                # Get all the front rgb images from the episode and put them in an array for the flava encoder
+                images = [
+                    obs.front_rgb for obs in demo
+                ]
+                task_instruct = get_instruct(task_env.get_name(), variation_count)
+                # Repeat the instruction for the length of the episode for the flava encoder
+                instructs = [
+                     task_instruct for n in range(len(demo))
+                ]
+                
+                # init the stack where we will assemble the data for each episode
+                stack = defaultdict(deque)
 
-                    if len(episode_keypoints) == 0:
-                        break
-                    # This function will convert only the first keypoint of the list into an action
-                    cont_action, disc_action = convert_keypoints(
-                        demo, episode_keypoints
-                    )
-                    obs_list.append(obs)
-                    cont_action_list.append(cont_action)
-                    disc_action_list.append(disc_action)
-                    t = (1.0 - i / float(len(demo) - 1)) * 2.0 - 1.0
-                    time_list.append(t)
-                    # Now add actions and observations for all keypoints after the current one
-                    (
-                        more_obs,
-                        more_cont_action,
-                        more_disc_action,
-                        more_timestep,
-                    ) = add_more(i, demo, obs, episode_keypoints)
-                    obs_list.extend(more_obs)
-                    cont_action_list.extend(more_cont_action)
-                    disc_action_list.extend(more_disc_action)
-                    time_list.extend(more_timestep)
+                # Split the image list into chunks of 10
+                chunk = len(images)//10
+                # for each chunk, get the embeddings from the flava encoder, add extra padding to the last chunk
+                for i in range(0, len(images)+chunk, chunk):
+                    images_chunk = images[i:i+chunk]
+                    instructs_chunk = instructs[i:i+chunk]
+                    # If the chunk is empty, skip it
+                    if len(images_chunk) > 0:
+                        flava_in = flava_processor(
+                            text=instructs_chunk,
+                            images=images_chunk,
+                            return_tensors="pt",
+                            padding="max_length",
+                            max_length=197,
+                            return_codebook_pixels=False,
+                            return_image_mask=False,
+                        )
+                        flava_out = flava_model(**flava_in)
+                        multimodal_embeddings = flava_out.multimodal_embeddings
+                        # For each of the multimodal embeddings, add the embeddings to the stack
+                        stack["encoder_emb"].extend(multimodal_embeddings.detach().numpy())
+                
 
-                stack = defaultdict(lambda: deque([], maxlen=FLAGS.num_frames))
-                for idx, timestep in enumerate(obs_list):
-                    for k in keys:
+                # Add the keyframe actions to the stack                
+                stack["kpnt_action"].extend(np.array(cont_action_list, dtype=np.float32))
+                # add the keypoint observation indices to the stack
+                stack["kpnt_idx"].extend(np.array(episode_keypoints, dtype=np.int32))
+                # add the gripper pose at the keypoint to the stack
+                # stack["kpnt_gripper_open"].extend(np.array([demo[kpnt].gripper_pose for kpnt in episode_keypoints], dtype=np.float32))
 
-                        if k == "gripper_open":
-                            v = np.array([timestep.__dict__[k]])
-                        elif k == "cont_action":
-                            v = cont_action_list[idx]
-                        elif k == "disc_action":
-                            v = disc_action_list[idx]
-                        elif k == "time":
-                            v = np.array([time_list[idx]])
-                        elif k == "gripper_pose_delta":
-                            timestep_tp1 = obs_list[min(idx + 1, len(obs_list) - 1)]
-                            v = (
-                                timestep_tp1.__dict__["gripper_pose"]
-                                - timestep.__dict__["gripper_pose"]
-                            )
-                        elif k == "task_id":
-                            v = np.frombuffer(
-                                str(task_name).encode("utf-8"), dtype=np.uint8
-                            )
-                        elif k == "variation_id":
-                            v = np.array([variation_count], dtype=np.uint8)
-                        elif k == "ignore_collisions":
-                            timestep_tm1 = obs_list[max(0, idx - 1)]
-                            v = np.array(
-                                [int(timestep_tm1.ignore_collisions)], dtype=np.uint8
-                            )
-                        else:
-                            v = timestep.__dict__[k]
+                # Add the episode and variation id to the stack
+                stack["task_id"].append(np.array(ex_idx, dtype=np.uint8))
+                stack["variation_id"].append(np.array(variation_count, dtype=np.uint8))
 
-                        if idx == 0:
-                            stack[k].extend([v] * FLAGS.num_frames)
-                        else:
-                            stack[k].append(v)
+                # Each element of this list contains all the data for each episode and task variation
+                total_data.append(stack)
+                
+               
 
-                    for k in keys:
-                        total_data[k].append(np.stack(stack[k]))
+                # for idx, timestep in enumerate(obs_list):
+                #     for k in keys:
 
-                    total_timestep += 1
+                #         if k == "gripper_open":
+                #             v = np.array([timestep.__dict__[k]])
+                #         elif k == "cont_action":
+                #             v = cont_action_list[idx]
+                #         elif k == "disc_action":
+                #             v = disc_action_list[idx]
+                #         elif k == "time":
+                #             v = np.array([time_list[idx]])
+                #         elif k == "gripper_pose_delta":
+                #             timestep_tp1 = obs_list[min(idx + 1, len(obs_list) - 1)]
+                #             v = (
+                #                 timestep_tp1.__dict__["gripper_pose"]
+                #                 - timestep.__dict__["gripper_pose"]
+                #             )
+                #         elif k == "task_id":
+                #             v = np.frombuffer(
+                #                 str(task_name).encode("utf-8"), dtype=np.uint8
+                #             )
+                #         elif k == "variation_id":
+                #             v = np.array([variation_count], dtype=np.uint8)
+                #         elif k == "ignore_collisions":
+                #             timestep_tm1 = obs_list[max(0, idx - 1)]
+                #             v = np.array(
+                #                 [int(timestep_tm1.ignore_collisions)], dtype=np.uint8
+                #             )
+                #         else:
+                #             v = timestep.__dict__[k]
+
+                #         if idx == 0:
+                #             stack[k].extend([v] * FLAGS.num_frames)
+                #         else:
+                #             stack[k].append(v)
+
+                #     for k in keys:
+                #         total_data[k].append(np.stack(stack[k]))
+
+                #     total_timestep += 1
+
                 # If we succeeded in collecting the data, then break out of the while loop
                 break
             if abort_variation:
@@ -323,29 +395,22 @@ def collect_data(
 
     start = time.process_time()
 
-    for k in keys:
+    # Write the total data struct to the h5 file creating groups and datasets for each key
+    for i, epi_dat in enumerate(total_data):
+        h5_grp = h5_file.create_group(f"{i}")
+        for k in epi_dat.keys():
+            # create the data set for each key
+            h5_dset = h5_grp.create_dataset(k, data=epi_dat[k])
+            # assign the data to the h5 dataset
+            h5_dset[:] = epi_dat[k]
 
-        v_shape, v_dtype = get_shape_dtype(k, dummy_timestep)
+    h5_file.close()
 
-        h5_file[k][:total_timestep] = np.array(total_data[k])
-
-        h5_file[k].resize((total_timestep, FLAGS.num_frames, *v_shape))
-        h5_file_shuffled[k].resize((total_timestep, FLAGS.num_frames, *v_shape))
 
     print(time.process_time() - start)
 
-    indices = list(range(total_timestep))
-    random.shuffle(indices)
+    
 
-    for i, j in enumerate(tqdm(indices, desc="shuffling", ncols=0)):
-        for k in keys:
-            if k == "task_id":
-                h5_file_shuffled[k][i] = h5_file[k][j][0]
-            else:
-                h5_file_shuffled[k][i] = h5_file[k][j]
-
-    h5_file.close()
-    h5_file_shuffled.close()
 
 
 def create_env():
@@ -426,20 +491,18 @@ def main(argv):
 
         # train
         train_hdf5_name = os.path.join(FLAGS.save_path, f"{task_name}_train.hdf5")
-        train_hdf5_shuffled_name = os.path.join(
-            FLAGS.save_path, f"{task_name}_train_shuffled.hdf5"
-        )
+        # train_hdf5_shuffled_name = os.path.join(
+        #     FLAGS.save_path, f"{task_name}_train_shuffled.hdf5"
+        # )
         try:
             os.remove(train_hdf5_name)
-            os.remove(train_hdf5_shuffled_name)
         except OSError:
             pass
 
-        h5_file, h5_file_shuffled = create_hdf5(
+        h5_file = create_hdf5(
             rlbench_env,
             tasks[task_index],
             train_hdf5_name,
-            train_hdf5_shuffled_name,
         )
         collect_data(
             rlbench_env,
@@ -447,26 +510,23 @@ def main(argv):
             task_name,
             tasks_with_problems,
             h5_file,
-            h5_file_shuffled,
             num_episodes=FLAGS.train_episodes_per_task,
         )
 
         # val
         val_hdf5_name = os.path.join(FLAGS.save_path, f"{task_name}_val.hdf5")
-        val_hdf5_shuffled_name = os.path.join(
-            FLAGS.save_path, f"{task_name}_val_shuffled.hdf5"
-        )
+        # val_hdf5_shuffled_name = os.path.join(
+        #     FLAGS.save_path, f"{task_name}_val_shuffled.hdf5"
+        # )
         try:
             os.remove(val_hdf5_name)
-            os.remove(val_hdf5_shuffled_name)
         except OSError:
             pass
 
-        h5_file, h5_file_shuffled = create_hdf5(
+        h5_file = create_hdf5(
             rlbench_env,
             tasks[task_index],
             val_hdf5_name,
-            val_hdf5_shuffled_name,
         )
         collect_data(
             rlbench_env,
@@ -474,17 +534,16 @@ def main(argv):
             task_name,
             tasks_with_problems,
             h5_file,
-            h5_file_shuffled,
             num_episodes=FLAGS.val_episodes_per_task,
         )
 
     print(tasks_with_problems)
 
-    combine_multi_task(rlbench_env, tasks, num_tasks)
+    # combine_multi_task(rlbench_env, tasks, num_tasks)
 
     rlbench_env.shutdown()
 
-    test(argv)
+    # test(argv)
 
 
 def combine_multi_task(rlbench_env, tasks, num_tasks):

@@ -281,11 +281,17 @@ def _get_cont_action(obs_tp1):
     )
 
 
-def convert_keypoints(demo, episode_keypoints, vox_size=100, rotation_resolution=5):
-    next_keypoint = episode_keypoints[0]
-    obs_tp = demo[next_keypoint]
-    cont_action = _get_cont_action(obs_tp)
-    disc_action = _get_disc_action(
-        obs_tp, vox_size=vox_size, rotation_resolution=rotation_resolution
-    )
-    return cont_action, disc_action
+def convert_keypoints(demo, episode_keypoints, vox_size=100, rotation_resolution=5, action_type="all"):
+    
+    cont_action_list = list()
+    disc_action_list = list()
+    for i, next_keypoint in enumerate(episode_keypoints):        
+        obs_tp = demo[next_keypoint]
+        if action_type == "cont" or action_type == "all":
+            cont_action_list.append(_get_cont_action(obs_tp))
+        if action_type == "disc" or action_type == "all":
+            disc_action_list.append(_get_disc_action(
+                obs_tp, vox_size=vox_size, rotation_resolution=rotation_resolution
+            ))
+    
+    return cont_action_list, disc_action_list

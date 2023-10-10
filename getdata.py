@@ -1,3 +1,4 @@
+from collections import defaultdict, deque
 import threading
 from io import BytesIO
 from queue import Queue
@@ -9,7 +10,6 @@ import torch
 from ml_collections import ConfigDict
 from PIL import Image
 from scipy.spatial.transform import Rotation
-from transformers import FlavaProcessor, FlavaModel
 
 
 
@@ -19,12 +19,12 @@ class RLBenchDataset(torch.utils.data.Dataset):
     def get_default_config(updates=None):
         config = ConfigDict()
 
-        config.path = "/home/levi/code/instructrl/data/keypoint"
+        config.path = "/home/levi/data/flavaActionDecoderData"
 
-        config.context_length = 4
+        # config.context_length = 4
         # We want the dataset to start at the context length + 1 so that we can a backward buffer of data
         # of context length
-        config.start_index = config.context_length
+        config.start_index = 0
         config.random_start = False
 
         config.image_size = 256
@@ -89,8 +89,16 @@ class RLBenchDataset(torch.utils.data.Dataset):
         #self.tokenizer = self.build_tokenizer()
 
         # Retrieve the Flava model and processor
-        self.model = FlavaModel.from_pretrained('facebook/flava-full')
-        self.processor = FlavaProcessor.from_pretrained('facebook/flava-full')
+        # self.model = FlavaModel.from_pretrained('facebook/flava-full')
+        # self.processor = FlavaProcessor.from_pretrained('facebook/flava-full')
+
+        # Create the master index set to access the data samples. List of tuples (str(idx), k) where idx is the string name index of the episode
+        # and k is the index of the data sample in the episode where action sequence starts
+        self.master_index = []
+        n_episodes = len(self.h5_file)
+        for idx in range(n_episodes):
+            n_obs = len(self.h5_file[str(idx)]['encoder_emb'])
+            self.master_index.extend([(str(idx), k) for k in range(n_obs)])
 
     def __getstate__(self):
         return self.config, self.random_start_offset, self.dataset_name
@@ -101,12 +109,13 @@ class RLBenchDataset(torch.utils.data.Dataset):
         self.random_start_offset = random_start_offset
         self.dataset_name = dataset_name
 
+    # Required to define this function when subclassing torch.utils.data.Dataset
     def __len__(self):
-        num_samples = self.h5_file["time"].shape[0] - self.config.start_index
+        num_samples = len(self.master_index)
         return num_samples
 
 
-    # This function is called when the dataset is indexed to randomize the starting point
+    # This function randomizes the starting index of the dataset
     def process_index(self, index):
         index = (index + self.random_start_offset) % len(self)
         return index + self.config.start_index
@@ -117,74 +126,101 @@ class RLBenchDataset(torch.utils.data.Dataset):
         index = self.process_index(index)
         # initialize the dictionary to store the data
         
-        # If we have state data, add it to the dictionary
-        # if self.config.state_key != "":
-        #     res["state"] = np.concatenate(
-        #         [self.h5_file[k][index] for k in self.config.state_key.split(", ")],
-        #         axis=-1,
-        #     )
-
+        
         # Go to the task file and get the instruction for the task
-        with BytesIO(self.h5_file["task_id"][index][0]) as fin:
-            task_id = fin.read().decode("utf-8")
-        variation_id = self.h5_file["variation_id"][index][0].item()
-        instruct = get_instruct(task_id, variation_id)
+        # with BytesIO(self.h5_file["task_id"][index][0]) as fin:
+        #     task_id = fin.read().decode("utf-8")
+        # variation_id = self.h5_file["variation_id"][index][0].item()
+        # instruct = get_instruct(task_id, variation_id)
 
         # tokenized_instruct, padding_mask = self.tokenizer(instruct)
 
         # res["instruct"] = tokenized_instruct
         # res["padding_mask"] = padding_mask
-        res = {"instruct": {}}
-        res["instruct"] = instruct
+        # res = {"instruct": {}}
+        # res["instruct"] = instruct
         
         
         # Concatenate and normalize the action data and add it to the dictionary
-        action_array= np.array([            
-            np.concatenate(
-                [
-                    self._normalize_quat(k, self.h5_file[k][index - n])
-                    for k in self.config.action_key.split(", ")
-                ],
-                axis=-1,
-            )            
-            for n in range(self.config.context_length)
-        ], dtype=np.float32)
+        # action_array= np.array([            
+        #     np.concatenate(
+        #         [
+        #             self._normalize_quat(k, self.h5_file[k][index - n])
+        #             for k in self.config.action_key.split(", ")
+        #         ],
+        #         axis=-1,
+        #     )            
+        #     for n in range(self.config.context_length)
+        # ], dtype=np.float32)
         # The first element of the action array is the learning target
-        target = action_array[0,...]        
-        # Pop the target off the front of the array and convert to a torch tensor, then get rid of the extra dimension
-        res["action"] = torch.squeeze(torch.tensor(np.delete(action_array, 0, 0)))
+        
+        
         
         # Loop through the RLBench cameras we define in the config extract the data from the hdf5 file
         # and add them to the dictionary
         # for key in self.config.image_key.split(", "):
         #     img_hold["image"][key] = self.h5_file[key][index]        
-        key = self.config.image_key.split(", ")[0]
+        # key = self.config.image_key.split(", ")[0]
        
-        images = [
-            self.h5_file[key][index - n][0,...]
-            for n in range(self.config.context_length)
-        ]
-        instructs = [
-            instruct for n in range(self.config.context_length)
-        ]
+        # images = [
+        #     self.h5_file[key][index - n][0,...]
+        #     for n in range(self.config.context_length)
+        # ]
+        # instructs = [
+        #     instruct for n in range(self.config.context_length)
+        # ]
         
-        flava_in = self.processor(
-            text=instructs,
-            images=images,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=197,
-            return_codebook_pixels=False,
-            return_image_mask=False,
+        # flava_in = self.processor(
+        #     text=instructs,
+        #     images=images,
+        #     return_tensors="pt",
+        #     padding="max_length",
+        #     max_length=197,
+        #     return_codebook_pixels=False,
+        #     return_image_mask=False,
+        # )
+
+        # flava_out = self.model(**flava_in)
+        # multimodal_embeddings = flava_out.multimodal_embeddings
+
+        # Each data sequence is composed of a starting observation and then an sequence of keypoint actions
+        # Add the starting observation encoder embedding and the list of keypoint actions
+        (ep_idx, obs_idx) = self.master_index[index]
+
+        data = defaultdict(deque)
+        data['encoder_emb'].extend([self.h5_file[ep_idx]['encoder_emb'][obs_idx]])
+        data['action'].extend(self.h5_file[ep_idx]['kpnt_action'][:])
+        data['task_id'].append(self.h5_file[ep_idx]['task_id'][0])
+        data['variation_id'].append(self.h5_file[ep_idx]['variation_id'][0])
+        # Return the target sequence with eos token
+        eos = np.zeros(self.config.action_dim, dtype=np.float32) 
+        eos[1::2] = -1 # odd values are -1
+        data['action'].append(eos)
+        target = data['action'].copy()
+        
+
+        # Now add the rest of the encoder embeddings corresponding to the keypoint actions
+        data['encoder_emb'].extend(
+            [self.h5_file[ep_idx]['encoder_emb'][kpnt_idx] for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']]
         )
 
-        flava_out = self.model(**flava_in)
-        multimodal_embeddings = flava_out.multimodal_embeddings
-        # We apply a mean pooling to the multimodal embeddings to get a single embedding for the whole instruction
-        res["mm_embeddings"] = torch.mean(multimodal_embeddings, dim=1)
-        
+        # Apply a mean pooling to the encoder embeddings to get a single embedding for each
+        for emb_idx in range(len(data['encoder_emb'])):
+            data['encoder_emb'][emb_idx] = np.mean(data['encoder_emb'][emb_idx], axis=0)
 
-        return res, target
+        
+        # Add the SOS token to the start of the action sequence (eos already added)
+        sos = np.zeros(self.config.action_dim, dtype=np.float32)
+        sos[0::2] = -1 # even values are -1
+        data['action'].appendleft(sos)
+
+        # Convert the deques to numpy arrays
+        data = {k: np.array(v) for k, v in data.items()}
+        data = {k: torch.tensor(v) for k, v in data.items()}
+        # Convert the target sequence to a torch tensor
+        target = torch.tensor(np.array(target))       
+
+        return (data, target)
 
     def _normalize_quat(self, name, quat):
 
@@ -308,20 +344,26 @@ def get_cont_action(
 
 
 if  __name__ == "__main__":
-
+    from getdata import RLBenchDataset
+    import torch
     dataset = RLBenchDataset(
         None,
         dataset_name="reach_target",
         start_offset_ratio=None,
         split="train",
     )
+
+    train_loader = torch.utils.data.DataLoader(    
+    dataset=dataset, 
+    batch_size=10, 
+    shuffle=True, 
+    num_workers=0)
+
     #print the keys to access the data fields for each data sample
-    print(dataset[0].keys())
-    print('image keys:')
-    print(dataset[0]["image"].keys())
-    print("action shape")
-    print(dataset[0]["action"])
-    print("instruct")
-    print(dataset[0]["instruct"])
-    print("padding_mask")
-    print(dataset[0]["padding_mask"])
+    print(f"Training dataset batch info:")
+    for i, (data, target) in enumerate(train_loader):
+        print("action:", data['action'].shape)
+        print("encoder_emb:", data['encoder_emb'].shape)
+        print("target:", target.shape)
+        break
+    print("num batches: " + str(len(train_loader)))
