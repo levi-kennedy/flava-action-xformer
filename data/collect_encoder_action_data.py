@@ -42,7 +42,8 @@ flags.DEFINE_string("save_path", "/home/levi/data/flavaActionDecoderData", "Wher
 flags.DEFINE_list(
     "tasks",    
     [
-        "reach_target"       
+        "reach_target",
+        "pick_up_cup",
     ],
     "The tasks to collect. If empty, all tasks are collected.",
 )
