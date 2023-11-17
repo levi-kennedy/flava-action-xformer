@@ -204,10 +204,10 @@ class RLBenchDataset(torch.utils.data.Dataset):
             [self.h5_file[ep_idx]['encoder_emb'][kpnt_idx] for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']]
         )
 
-        # Apply a mean pooling to the encoder embeddings to get a single embedding for each
-        for emb_idx in range(len(data['encoder_emb'])):
-            data['encoder_emb'][emb_idx] = np.mean(data['encoder_emb'][emb_idx], axis=0)
-
+        # Apply a transform to the encoder embeddings to get a single embedding for each
+        #for emb_idx in range(len(data['encoder_emb'])):
+            #data['encoder_emb'][emb_idx] = np.mean(data['encoder_emb'][emb_idx], axis=0)
+        
         
         # Add the SOS token to the start of the action sequence (eos already added)
         sos = np.zeros(self.config.action_dim, dtype=np.float32)
@@ -216,7 +216,14 @@ class RLBenchDataset(torch.utils.data.Dataset):
 
         # Convert the deques to numpy arrays
         data = {k: np.array(v) for k, v in data.items()}
+
+        enc_emb_shape = data['encoder_emb'].shape
+        data['encoder_emb'] = np.reshape(data['encoder_emb'][0,:],(-1, enc_emb_shape[-1]))
+
+        # Convert the numpy arrays to torch tensors
         data = {k: torch.tensor(v) for k, v in data.items()}
+
+        
         # Convert the target sequence to a torch tensor
         target = torch.tensor(np.array(target))       
 
