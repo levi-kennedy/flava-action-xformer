@@ -43,19 +43,25 @@ flags.DEFINE_list(
     "tasks",    
     [
         "reach_target",
-        "pick_up_cup",
     ],
     "The tasks to collect. If empty, all tasks are collected.",
 )
 flags.DEFINE_list("image_size", [256, 256], "The size of the images to save.")
+# An episode is defined as a specific physical starting state (most likely layout/positioning) 
+# of the task objects for a particular variation, and these must differ between episodes across 
+# the same variation with the same semantic description. At minimum, the positioning/orientation 
+# of task objects must vary with episodes
 flags.DEFINE_integer(
-    "train_episodes_per_task", 5, "The number of episodes to collect per task."
+    "train_episodes_per_task", 30, "The number of episodes to collect per task."
 )
 flags.DEFINE_integer(
-    "val_episodes_per_task", 2, "The number of episodes to collect per task."
+    "val_episodes_per_task", 5, "The number of episodes to collect per task."
 )
+# A variation is thus defined as a specific semantic meaning of the textual 
+# description of the task, such that different variations actually instruct 
+# the robot to do something slightly different on every variation. (different colors)
 flags.DEFINE_integer(
-    "variations", 5, "Number of variations to collect per task. -1 for all."
+    "variations", 6, "Number of variations to collect per episode. -1 for all."
 )
 flags.DEFINE_integer("num_frames", 1, "Number of frames to stack.")
 flags.DEFINE_integer("vox_size", 16, "Voxel size to discretize translation.")
@@ -243,10 +249,10 @@ def collect_data(
 
     print("Task:", task_env.get_name(), "// Variation Target:", var_target)
 
-    # Retrieve the Flava model and processor
+    # Retrieve the Flava model and processor and put then in the GPU
     flava_model = FlavaModel.from_pretrained('facebook/flava-full')
     flava_processor = FlavaProcessor.from_pretrained('facebook/flava-full')
-
+    
     # Iterate through the variations of the task
     while True:
         if variation_count >= var_target:
@@ -294,42 +300,48 @@ def collect_data(
                 )
                 obs_list = []
                 time_list = []               
-                # Get all the front rgb images from the episode and put them in an array for the flava encoder
+                # Get the subsampled indices of the demo episode for every fifth timestep
+                # These will be the indices of the demo where the training sequence will start
+                demo_startpoint_indices = np.arange(0, len(demo), 5)
+                # Now we want to make sure we have indices from the demo that include the keypoints we want to train on
+                # the subsampling above may have excluded some of the keypoints
+                demo_subset_indices = np.union1d(demo_startpoint_indices, episode_keypoints)
+                # get the subset of demo observations we want convert to encoder embeddings
+                demo_subset_obs = [demo[i] for i in demo_subset_indices]
+                
                 images = [
-                    obs.front_rgb for obs in demo
+                    [obs.left_shoulder_rgb, obs.right_shoulder_rgb, obs.wrist_rgb] for obs in demo_subset_obs
                 ]
+                
                 task_instruct = get_instruct(task_env.get_name(), variation_count)
-                # Repeat the instruction for the length of the episode for the flava encoder
-                instructs = [
-                     task_instruct for n in range(len(demo))
-                ]
                 
                 # init the stack where we will assemble the data for each episode
                 stack = defaultdict(deque)
+               
+                # WHAT IS HAPPENING HERE: 
 
-                # Split the image list into chunks of 10
-                chunk = len(images)//10
-                # for each chunk, get the embeddings from the flava encoder, add extra padding to the last chunk
-                for i in range(0, len(images)+chunk, chunk):
-                    images_chunk = images[i:i+chunk]
-                    instructs_chunk = instructs[i:i+chunk]
-                    # If the chunk is empty, skip it
-                    if len(images_chunk) > 0:
-                        flava_in = flava_processor(
-                            text=instructs_chunk,
-                            images=images_chunk,
-                            return_tensors="pt",
-                            padding="max_length",
-                            max_length=197,
-                            return_codebook_pixels=False,
-                            return_image_mask=False,
-                        )
-                        flava_out = flava_model(**flava_in)
-                        multimodal_embeddings = flava_out.multimodal_embeddings
-                        # For each of the multimodal embeddings, add the embeddings to the stack
-                        stack["encoder_emb"].extend(multimodal_embeddings.detach().numpy())
+                # processing the 3 images for each timestep
+                for img_set in images:
+                    # generate a set of instructions to match the set of images going into the encoder                    
+                    instruction = [task_instruct for n in range(len(img_set))]                    
+                    flava_in = flava_processor(
+                        text=instruction,
+                        images=img_set,
+                        return_tensors="pt",
+                        padding="max_length",
+                        max_length=197,
+                        return_codebook_pixels=False,
+                        return_image_mask=False,
+                    )
+                    flava_out = flava_model(**flava_in)
+                    multimodal_embeddings = flava_out.multimodal_embeddings
+                    # For each of the multimodal embeddings, add the embeddings to the stack
+                    stack["encoder_emb"].append(multimodal_embeddings.detach().numpy())
                 
+                # Add the encoder_indices to the stack
+                stack["encoder_emb_indices"].extend(np.array(demo_subset_indices, dtype=np.int32))
 
+                
                 # Add the keyframe actions to the stack                
                 stack["kpnt_action"].extend(np.array(cont_action_list, dtype=np.float32))
                 # add the keypoint observation indices to the stack
@@ -340,54 +352,12 @@ def collect_data(
                 # Add the episode and variation id to the stack
                 stack["task_id"].append(np.array(ex_idx, dtype=np.uint8))
                 stack["variation_id"].append(np.array(variation_count, dtype=np.uint8))
+                #stack["instruction"] = task_instruct
 
                 # Each element of this list contains all the data for each episode and task variation
                 total_data.append(stack)
                 
                
-
-                # for idx, timestep in enumerate(obs_list):
-                #     for k in keys:
-
-                #         if k == "gripper_open":
-                #             v = np.array([timestep.__dict__[k]])
-                #         elif k == "cont_action":
-                #             v = cont_action_list[idx]
-                #         elif k == "disc_action":
-                #             v = disc_action_list[idx]
-                #         elif k == "time":
-                #             v = np.array([time_list[idx]])
-                #         elif k == "gripper_pose_delta":
-                #             timestep_tp1 = obs_list[min(idx + 1, len(obs_list) - 1)]
-                #             v = (
-                #                 timestep_tp1.__dict__["gripper_pose"]
-                #                 - timestep.__dict__["gripper_pose"]
-                #             )
-                #         elif k == "task_id":
-                #             v = np.frombuffer(
-                #                 str(task_name).encode("utf-8"), dtype=np.uint8
-                #             )
-                #         elif k == "variation_id":
-                #             v = np.array([variation_count], dtype=np.uint8)
-                #         elif k == "ignore_collisions":
-                #             timestep_tm1 = obs_list[max(0, idx - 1)]
-                #             v = np.array(
-                #                 [int(timestep_tm1.ignore_collisions)], dtype=np.uint8
-                #             )
-                #         else:
-                #             v = timestep.__dict__[k]
-
-                #         if idx == 0:
-                #             stack[k].extend([v] * FLAGS.num_frames)
-                #         else:
-                #             stack[k].append(v)
-
-                #     for k in keys:
-                #         total_data[k].append(np.stack(stack[k]))
-
-                #     total_timestep += 1
-
-                # If we succeeded in collecting the data, then break out of the while loop
                 break
             if abort_variation:
                 break
@@ -398,7 +368,7 @@ def collect_data(
 
     # Write the total data struct to the h5 file creating groups and datasets for each key
     for i, epi_dat in enumerate(total_data):
-        h5_grp = h5_file.create_group(f"{i}")
+        h5_grp = h5_file.create_group(f"{i:04d}")
         for k in epi_dat.keys():
             # create the data set for each key
             h5_dset = h5_grp.create_dataset(k, data=epi_dat[k])
@@ -434,10 +404,10 @@ def create_env():
 
     obs_config = ObservationConfig(
         left_shoulder_camera=CAMERA_CONFIG_ON,
-        right_shoulder_camera=CAMERA_CONFIG_OFF,
+        right_shoulder_camera=CAMERA_CONFIG_ON,
         overhead_camera=CAMERA_CONFIG_OFF,
-        wrist_camera=CAMERA_CONFIG_OFF,
-        front_camera=CAMERA_CONFIG_ON
+        wrist_camera=CAMERA_CONFIG_ON,
+        front_camera=CAMERA_CONFIG_OFF
 
     )
     obs_config.set_all_low_dim(True)

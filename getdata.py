@@ -70,14 +70,8 @@ class RLBenchDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Unknown split: {split}")
         
-        # Load the dataset from Google Cloud Storage
-        if self.config.path.startswith("gs://"):
-            self.h5_file = h5py.File(
-                gcsfs.GCSFileSystem().open(path, cache_type="block"), "r"
-            )
-        # Load the dataset from local storage
-        else:
-            self.h5_file = h5py.File(path, "r")
+        # Open the hdf5 file where the data is stored
+        self.h5_file = h5py.File(path, "r")
 
         if self.config.random_start:
             self.random_start_offset = np.random.default_rng().choice(len(self))
@@ -86,19 +80,15 @@ class RLBenchDataset(torch.utils.data.Dataset):
         else:
             self.random_start_offset = 0
 
-        #self.tokenizer = self.build_tokenizer()
-
-        # Retrieve the Flava model and processor
-        # self.model = FlavaModel.from_pretrained('facebook/flava-full')
-        # self.processor = FlavaProcessor.from_pretrained('facebook/flava-full')
 
         # Create the master index set to access the data samples. List of tuples (str(idx), k) where idx is the string name index of the episode
         # and k is the index of the data sample in the episode where action sequence starts
         self.master_index = []
         n_episodes = len(self.h5_file)
         for idx in range(n_episodes):
-            n_obs = len(self.h5_file[str(idx)]['encoder_emb'])
-            self.master_index.extend([(str(idx), k) for k in range(n_obs)])
+            idx = f'{idx:04d}'
+            n_obs = len(self.h5_file[idx]['encoder_emb'])
+            self.master_index.extend([(idx, k) for k in range(n_obs)])
 
     def __getstate__(self):
         return self.config, self.random_start_offset, self.dataset_name
@@ -115,75 +105,18 @@ class RLBenchDataset(torch.utils.data.Dataset):
         return num_samples
 
 
-    # This function randomizes the starting index of the dataset
+    # This function randomizes the starting index of the dataset (off by default)
     def process_index(self, index):
         index = (index + self.random_start_offset) % len(self)
         return index + self.config.start_index
 
-    # This function is called when the dataset is indexed to get the data sample
+    # This function is called when the dataset is indexed to get the data sequence
     def __getitem__(self, index):
-        # Get the conditioned index for the data buffer
+        # Get a possibly randomized index
         index = self.process_index(index)
-        # initialize the dictionary to store the data
         
-        
-        # Go to the task file and get the instruction for the task
-        # with BytesIO(self.h5_file["task_id"][index][0]) as fin:
-        #     task_id = fin.read().decode("utf-8")
-        # variation_id = self.h5_file["variation_id"][index][0].item()
-        # instruct = get_instruct(task_id, variation_id)
 
-        # tokenized_instruct, padding_mask = self.tokenizer(instruct)
-
-        # res["instruct"] = tokenized_instruct
-        # res["padding_mask"] = padding_mask
-        # res = {"instruct": {}}
-        # res["instruct"] = instruct
-        
-        
-        # Concatenate and normalize the action data and add it to the dictionary
-        # action_array= np.array([            
-        #     np.concatenate(
-        #         [
-        #             self._normalize_quat(k, self.h5_file[k][index - n])
-        #             for k in self.config.action_key.split(", ")
-        #         ],
-        #         axis=-1,
-        #     )            
-        #     for n in range(self.config.context_length)
-        # ], dtype=np.float32)
-        # The first element of the action array is the learning target
-        
-        
-        
-        # Loop through the RLBench cameras we define in the config extract the data from the hdf5 file
-        # and add them to the dictionary
-        # for key in self.config.image_key.split(", "):
-        #     img_hold["image"][key] = self.h5_file[key][index]        
-        # key = self.config.image_key.split(", ")[0]
-       
-        # images = [
-        #     self.h5_file[key][index - n][0,...]
-        #     for n in range(self.config.context_length)
-        # ]
-        # instructs = [
-        #     instruct for n in range(self.config.context_length)
-        # ]
-        
-        # flava_in = self.processor(
-        #     text=instructs,
-        #     images=images,
-        #     return_tensors="pt",
-        #     padding="max_length",
-        #     max_length=197,
-        #     return_codebook_pixels=False,
-        #     return_image_mask=False,
-        # )
-
-        # flava_out = self.model(**flava_in)
-        # multimodal_embeddings = flava_out.multimodal_embeddings
-
-        # Each data sequence is composed of a starting observation and then an sequence of keypoint actions
+        # Each data sequence is composed of a starting observation and then a sequence of keypoint actions
         # Add the starting observation encoder embedding and the list of keypoint actions
         (ep_idx, obs_idx) = self.master_index[index]
 
@@ -192,33 +125,44 @@ class RLBenchDataset(torch.utils.data.Dataset):
         data['action'].extend(self.h5_file[ep_idx]['kpnt_action'][:])
         data['task_id'].append(self.h5_file[ep_idx]['task_id'][0])
         data['variation_id'].append(self.h5_file[ep_idx]['variation_id'][0])
-        # Return the target sequence with eos token
-        eos = np.zeros(self.config.action_dim, dtype=np.float32) 
-        eos[1::2] = -1 # odd values are -1
-        data['action'].append(eos)
-        target = data['action'].copy()
+        
         
 
         # Now add the rest of the encoder embeddings corresponding to the keypoint actions
-        data['encoder_emb'].extend(
-            [self.h5_file[ep_idx]['encoder_emb'][kpnt_idx] for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']]
-        )
+        for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']:
+            # get the embedding index where the kpnt_idx matches the embedding index
+            emb_idx = np.where(self.h5_file[ep_idx]['encoder_emb_indices'][:] == kpnt_idx)[0][0]
+            data['encoder_emb'].append(self.h5_file[ep_idx]['encoder_emb'][emb_idx])
+
+
+        
 
         # Apply a transform to the encoder embeddings to get a single embedding for each
         #for emb_idx in range(len(data['encoder_emb'])):
             #data['encoder_emb'][emb_idx] = np.mean(data['encoder_emb'][emb_idx], axis=0)
         
         
-        # Add the SOS token to the start of the action sequence (eos already added)
+        target = data['action'].copy()
+
+        # Return the target sequence with eos token
+        eos = np.zeros(self.config.action_dim, dtype=np.float32) 
+        eos[1::2] = -1 # odd values are -1
+        # normalize the eos token
+        eos = eos / np.linalg.norm(eos)
+        target.append(eos)
+
+        # Add the SOS token to the start of the action sequence 
         sos = np.zeros(self.config.action_dim, dtype=np.float32)
         sos[0::2] = -1 # even values are -1
+        # normalize the sos token
+        sos = sos / np.linalg.norm(sos)
         data['action'].appendleft(sos)
 
         # Convert the deques to numpy arrays
         data = {k: np.array(v) for k, v in data.items()}
 
         enc_emb_shape = data['encoder_emb'].shape
-        data['encoder_emb'] = np.reshape(data['encoder_emb'][0,:],(-1, enc_emb_shape[-1]))
+        #data['encoder_emb'] = np.reshape(data['encoder_emb'],(enc_emb_shape[0],-1, enc_emb_shape[-1]))
 
         # Convert the numpy arrays to torch tensors
         data = {k: torch.tensor(v) for k, v in data.items()}
