@@ -52,7 +52,7 @@ flags.DEFINE_list("image_size", [256, 256], "The size of the images to save.")
 # the same variation with the same semantic description. At minimum, the positioning/orientation 
 # of task objects must vary with episodes
 flags.DEFINE_integer(
-    "train_episodes_per_task", 30, "The number of episodes to collect per task."
+    "train_episodes_per_task", 100, "The number of episodes to collect per task."
 )
 flags.DEFINE_integer(
     "val_episodes_per_task", 5, "The number of episodes to collect per task."
@@ -292,36 +292,29 @@ def collect_data(
                     break
                 
                 
+                # init the stack where we will assemble the data for each episode
+                stack = defaultdict(deque)
+
+                task_instruct = get_instruct(task_env.get_name(), variation_count)
+
+                ### Save keypoint data ###
                 # Element indices of the keypoints in the demo
                 episode_keypoints = keypoint_discovery(demo)
                 # Convert all the keypoints into list of poses at the keypoint indices
-                cont_action_list, disc_action_list = convert_keypoints(
+                kpnt_cont_action_list, disc_action_list = convert_keypoints(
                     demo, episode_keypoints, action_type="cont",
                 )
-                obs_list = []
-                time_list = []               
-                # Get the subsampled indices of the demo episode for every fifth timestep
-                # These will be the indices of the demo where the training sequence will start
-                demo_startpoint_indices = np.arange(0, len(demo), 5)
-                # Now we want to make sure we have indices from the demo that include the keypoints we want to train on
-                # the subsampling above may have excluded some of the keypoints
-                demo_subset_indices = np.union1d(demo_startpoint_indices, episode_keypoints)
-                # get the subset of demo observations we want convert to encoder embeddings
-                demo_subset_obs = [demo[i] for i in demo_subset_indices]
-                
-                images = [
+                # Add the keyframe actions to the stack                
+                stack["kpnt_action"].extend(np.array(kpnt_cont_action_list, dtype=np.float32))
+
+                # get the subset of demo observations we want to convert to encoder embeddings
+                demo_subset_obs = [demo[i] for i in episode_keypoints]
+                kpnt_images = [
                     [obs.left_shoulder_rgb, obs.right_shoulder_rgb, obs.wrist_rgb] for obs in demo_subset_obs
                 ]
-                
-                task_instruct = get_instruct(task_env.get_name(), variation_count)
-                
-                # init the stack where we will assemble the data for each episode
-                stack = defaultdict(deque)
-               
-                # WHAT IS HAPPENING HERE: 
 
                 # processing the 3 images for each timestep
-                for img_set in images:
+                for img_set in kpnt_images:
                     # generate a set of instructions to match the set of images going into the encoder                    
                     instruction = [task_instruct for n in range(len(img_set))]                    
                     flava_in = flava_processor(
@@ -329,25 +322,60 @@ def collect_data(
                         images=img_set,
                         return_tensors="pt",
                         padding="max_length",
-                        max_length=197,
+                        max_length=52,
                         return_codebook_pixels=False,
                         return_image_mask=False,
                     )
                     flava_out = flava_model(**flava_in)
-                    multimodal_embeddings = flava_out.multimodal_embeddings
+                    multimodal_embeddings = flava_out.multimodal_output.pooler_output
                     # For each of the multimodal embeddings, add the embeddings to the stack
-                    stack["encoder_emb"].append(multimodal_embeddings.detach().numpy())
-                
-                # Add the encoder_indices to the stack
-                stack["encoder_emb_indices"].extend(np.array(demo_subset_indices, dtype=np.int32))
+                    stack["kpnt_encoder_emb"].append(multimodal_embeddings.detach().numpy())
 
                 
-                # Add the keyframe actions to the stack                
-                stack["kpnt_action"].extend(np.array(cont_action_list, dtype=np.float32))
                 # add the keypoint observation indices to the stack
                 stack["kpnt_idx"].extend(np.array(episode_keypoints, dtype=np.int32))
                 # add the gripper pose at the keypoint to the stack
-                # stack["kpnt_gripper_open"].extend(np.array([demo[kpnt].gripper_pose for kpnt in episode_keypoints], dtype=np.float32))
+
+                ### Save startpoint data ###
+                # Get the subsampled indices of the demo episode for every fifth timestep
+                # These will be the indices of the demo where the training sequence will start
+                demo_startpoint_indices = np.arange(0, len(demo), 5)
+                demo_startpoint_indices = [0]
+                # Do not include keypoint indices in the starting point indices 
+                demo_startpoint_indices = np.setdiff1d(demo_startpoint_indices, episode_keypoints)           
+                # Convert all the startpoint indices into list of poses at the keypoint indices
+                startpoint_cont_action_list, disc_action_list = convert_keypoints(
+                    demo, demo_startpoint_indices, action_type="cont",
+                )
+                # Add the keyframe actions to the stack                
+                stack["startpoint_action"].extend(np.array(startpoint_cont_action_list, dtype=np.float32))
+                # get the subset of demo observations we want to convert to encoder embeddings
+                demo_subset_obs = [demo[i] for i in demo_startpoint_indices]
+                
+                startpoint_images = [
+                    [obs.left_shoulder_rgb, obs.right_shoulder_rgb, obs.wrist_rgb] for obs in demo_subset_obs
+                ]
+                
+                # processing the 3 images for each timestep
+                for img_set in startpoint_images:
+                    # generate a set of instructions to match the set of images going into the encoder                    
+                    instruction = [task_instruct for n in range(len(img_set))]                    
+                    flava_in = flava_processor(
+                        text=instruction,
+                        images=img_set,
+                        return_tensors="pt",
+                        padding="max_length",
+                        max_length=52,
+                        return_codebook_pixels=False,
+                        return_image_mask=False,
+                    )
+                    flava_out = flava_model(**flava_in)
+                    multimodal_embeddings = flava_out.multimodal_output.pooler_output
+                    # For each of the multimodal embeddings, add the embeddings to the stack
+                    stack["startpoint_encoder_emb"].append(multimodal_embeddings.detach().numpy())
+                
+                # Add the encoder_indices to the stack
+                stack["startpoint_idx"].extend(np.array(demo_startpoint_indices, dtype=np.int32))
 
                 # Add the episode and variation id to the stack
                 stack["task_id"].append(np.array(ex_idx, dtype=np.uint8))

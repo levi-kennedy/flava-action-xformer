@@ -87,7 +87,7 @@ class RLBenchDataset(torch.utils.data.Dataset):
         n_episodes = len(self.h5_file)
         for idx in range(n_episodes):
             idx = f'{idx:04d}'
-            n_obs = len(self.h5_file[idx]['encoder_emb'])
+            n_obs = len(self.h5_file[idx]['startpoint_encoder_emb'])
             self.master_index.extend([(idx, k) for k in range(n_obs)])
 
     def __getstate__(self):
@@ -121,18 +121,34 @@ class RLBenchDataset(torch.utils.data.Dataset):
         (ep_idx, obs_idx) = self.master_index[index]
 
         data = defaultdict(deque)
-        data['encoder_emb'].extend([self.h5_file[ep_idx]['encoder_emb'][obs_idx]])
-        data['action'].extend(self.h5_file[ep_idx]['kpnt_action'][:])
+        # Add the start observation encoder embedding and then concatenate the keypoints afterward
+        data['encoder_emb'] = np.expand_dims(self.h5_file[ep_idx]['startpoint_encoder_emb'][obs_idx], axis=(0))
+        data['encoder_emb'] = np.concatenate((data['encoder_emb'], self.h5_file[ep_idx]['kpnt_encoder_emb'][:]), axis=0)
+        # Remove the last encoder embedding since we won't see that data point during training
+        data['encoder_emb'] = data['encoder_emb'][:-1]
+
+        # Add the start observation action and then concatenate the keypoints afterward
+        data['action'] = np.expand_dims(self.h5_file[ep_idx]['startpoint_action'][obs_idx], axis=(0))
+        data['action'] = np.concatenate((data['action'], self.h5_file[ep_idx]['kpnt_action'][:]), axis=0)
+
+        target = data['action'].copy()
+
+        # Remove the last action since we won't see that data point during training
+        data['action'] = data['action'][:-1]
+
+        # Remove the first target since we won't see that data point during training
+        target = target[1:]
+
         data['task_id'].append(self.h5_file[ep_idx]['task_id'][0])
         data['variation_id'].append(self.h5_file[ep_idx]['variation_id'][0])
         
         
 
-        # Now add the rest of the encoder embeddings corresponding to the keypoint actions
-        for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']:
-            # get the embedding index where the kpnt_idx matches the embedding index
-            emb_idx = np.where(self.h5_file[ep_idx]['encoder_emb_indices'][:] == kpnt_idx)[0][0]
-            data['encoder_emb'].append(self.h5_file[ep_idx]['encoder_emb'][emb_idx])
+        # # Now add the rest of the encoder embeddings corresponding to the keypoint actions
+        # for kpnt_idx in self.h5_file[ep_idx]['kpnt_idx']:
+        #     # get the embedding index where the kpnt_idx matches the embedding index
+        #     emb_idx = np.where(self.h5_file[ep_idx]['encoder_emb_indices'][:] == kpnt_idx)[0][0]
+        #     data['encoder_emb'].append(self.h5_file[ep_idx]['encoder_emb'][emb_idx])
 
 
         
@@ -142,21 +158,21 @@ class RLBenchDataset(torch.utils.data.Dataset):
             #data['encoder_emb'][emb_idx] = np.mean(data['encoder_emb'][emb_idx], axis=0)
         
         
-        target = data['action'].copy()
+       
 
         # Return the target sequence with eos token
-        eos = np.zeros(self.config.action_dim, dtype=np.float32) 
-        eos[1::2] = -1 # odd values are -1
-        # normalize the eos token
-        eos = eos / np.linalg.norm(eos)
-        target.append(eos)
+        # eos = np.zeros(self.config.action_dim, dtype=np.float32) 
+        # eos[1::2] = -1 # odd values are -1
+        # # normalize the eos token
+        # eos = eos / np.linalg.norm(eos)
+        # target.append(eos)
 
-        # Add the SOS token to the start of the action sequence 
-        sos = np.zeros(self.config.action_dim, dtype=np.float32)
-        sos[0::2] = -1 # even values are -1
-        # normalize the sos token
-        sos = sos / np.linalg.norm(sos)
-        data['action'].appendleft(sos)
+        # # Add the SOS token to the start of the action sequence 
+        # sos = np.zeros(self.config.action_dim, dtype=np.float32)
+        # sos[0::2] = -1 # even values are -1
+        # # normalize the sos token
+        # sos = sos / np.linalg.norm(sos)
+        # data['action'].appendleft(sos)
 
         # Convert the deques to numpy arrays
         data = {k: np.array(v) for k, v in data.items()}
